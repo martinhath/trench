@@ -1,0 +1,13 @@
+[package]
+name = "trench"
+version = "0.1.1"
+authors = ["Martin Hafskjold Thoresen <martinhath@gmail.com>"]
+description = "A benchmark suite for writing threaded benchmarks"
+keywords = ["profile", "multithreading", "threading", "concurrency"]
+categories = ["development-tools"]
+license = "MIT"
+homepage = "https://www.github.com/martinhath/trench"
+readme = "README.md"
+
+[dependencies]
+time = "0.1"
