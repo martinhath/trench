@@ -8,69 +8,24 @@
 
 extern crate time;
 
-use std::str::FromStr;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 const DEFAULT_NUM_SAMPLES: usize = 200;
 
+/// Statistics from a benchmark run.
 #[derive(Debug, Clone)]
 pub struct BenchStats {
-    ident: BenchIdentifier,
+    /// An identifier for what benchmark this is.
+    ident: String,
+    /// The timings from this benchmark.
     samples: Vec<u64>,
 }
 
 impl BenchStats {
-    pub fn variant(&self) -> &str {
-        &self.ident.variant
-    }
-    pub fn name(&self) -> &str {
-        &self.ident.name
-    }
-    pub fn threads(&self) -> usize {
-        self.ident.threads
-    }
-
-    pub fn string(&self) -> String {
-        self.ident.string()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BenchIdentifier {
-    variant: String,
-    name: String,
-    threads: usize,
-}
-
-impl BenchIdentifier {
-    pub fn string(&self) -> String {
-        format!("{}::{}::{:02}", self.variant, self.name, self.threads)
-    }
-}
-
-impl FromStr for BenchIdentifier {
-    type Err = ();
-    fn from_str(s: &str) -> Result<BenchIdentifier, Self::Err> {
-        let split = s.split("::").collect::<Vec<_>>();
-        Ok(match split.len() {
-            3 => {
-                BenchIdentifier {
-                    variant: split[0].to_string(),
-                    name: split[1].to_string(),
-                    threads: split[2].parse().map_err(|_| ())?,
-                }
-            }
-            4 => {
-                BenchIdentifier {
-                    variant: split[0].to_string(),
-                    name: format!("{}_{}", split[1], split[2]),
-                    threads: split[3].parse().map_err(|_| ())?,
-                }
-            }
-            _ => return Err(()),
-        })
+    pub fn ident(&self) -> &str {
+        &self.ident
     }
 }
 
@@ -79,10 +34,12 @@ impl BenchStats {
         self.samples.len() as u64
     }
 
+    /// Get the average of the samples
     pub fn average(&self) -> u64 {
         self.samples.iter().cloned().sum::<u64>() / self.len()
     }
 
+    /// Get the variance of the samples
     pub fn variance(&self) -> u64 {
         let avg = self.average();
         let s = self.samples
@@ -93,24 +50,30 @@ impl BenchStats {
         (s as f32).sqrt() as u64
     }
 
+    /// Get the minimum of the samples
     pub fn min(&self) -> u64 {
         self.samples.iter().cloned().min().unwrap()
     }
 
+    /// Get the maximum of the samples
     pub fn max(&self) -> u64 {
         self.samples.iter().cloned().max().unwrap()
     }
 
+    /// Get the number of samples that are above the average
     pub fn above_avg(&self) -> u64 {
         let avg = self.average();
         self.samples.iter().filter(|&&s| s > avg).count() as u64
     }
 
+    /// Get the number of samples that are below the average
     pub fn below_avg(&self) -> u64 {
         let avg = self.average();
         self.samples.iter().filter(|&&s| s < avg).count() as u64
     }
 
+    /// Get a human readable string of these statistics. This is indended to mimic the format used
+    /// by `cargo bench`.
     pub fn report(&self) -> String {
         format!(
             "{} ns/iter (+/- {}) min={} max={} above={} below={}",
@@ -123,18 +86,8 @@ impl BenchStats {
         )
     }
 
-    pub fn csv_header() -> String {
-        format!(
-            "{};{};{};{};{};{}",
-            "average",
-            "variance",
-            "min",
-            "max",
-            "# above avg",
-            "# below avg"
-        )
-    }
-
+    /// Write out the statistics separated by `;`. This does not write out the samples; it is a
+    /// single line with average, variance, etc.
     pub fn csv(&self) -> String {
         format!(
             "{};{};{};{};{};{}",
@@ -147,6 +100,20 @@ impl BenchStats {
         )
     }
 
+    /// Get the csv header.
+    pub fn csv_header() -> String {
+        format!(
+            "{};{};{};{};{};{}",
+            "average",
+            "variance",
+            "min",
+            "max",
+            "# above avg",
+            "# below avg"
+        )
+    }
+
+    /// Get the samples.
     pub fn samples(&self) -> &[u64] {
         &self.samples
     }
@@ -182,8 +149,7 @@ pub fn gnuplot(stats: &[BenchStats]) -> String {
     let mut s = String::new();
     let lines = stats.iter().map(|b| b.samples.len()).max().unwrap_or(0);
     for stats in stats {
-        let asd: String = stats.ident.string();
-        s.push_str(&asd);
+        s.push_str(&stats.ident());
     }
     s.push('\n');
     for i in 0..lines {
@@ -196,76 +162,11 @@ pub fn gnuplot(stats: &[BenchStats]) -> String {
     s
 }
 
-pub struct Bencher<S> {
-    samples: Vec<u64>,
-    n: usize,
-    pre: Box<Fn(&mut S)>,
-    post: Box<Fn(&mut S)>,
-    between: Box<Fn(&mut S)>,
-}
-
+/// A `black_box` function, to avoid compiler optimizations.
 pub fn black_box<T>(dummy: T) -> T {
     // we need to "use" the argument in some way LLVM can't introspect.
     unsafe { asm!("" : : "r"(&dummy)) }
     dummy
-}
-
-impl<S> Bencher<S> {
-    pub fn new() -> Self {
-        Bencher {
-            samples: vec![],
-            n: 10_000,
-            pre: Box::new(|_| {}),
-            post: Box::new(|_| {}),
-            between: Box::new(|_| {}),
-        }
-    }
-
-    pub fn set_n(&mut self, n: usize) {
-        self.n = n;
-    }
-
-    pub fn bench<F: Fn(&mut S)>(&mut self, mut state: S, f: F) -> S {
-        (self.pre)(&mut state);
-        for _ in 0..self.n {
-            let t0 = time::precise_time_ns();
-            black_box(f(&mut state));
-            let t1 = time::precise_time_ns();
-            self.samples.push(t1 - t0);
-            (self.between)(&mut state);
-        }
-        (self.post)(&mut state);
-        state
-    }
-
-    pub fn output_samples<W: ::std::io::Write>(
-        &self,
-        mut writer: W,
-    ) -> Result<(), ::std::io::Error> {
-        for sample in &self.samples {
-            writer.write_fmt(format_args!("{}\n", sample))?;
-        }
-        Ok(())
-    }
-
-    pub fn pre<F: 'static + Fn(&mut S)>(&mut self, f: F) {
-        self.pre = Box::new(f);
-    }
-
-    pub fn post<F: 'static + Fn(&mut S)>(&mut self, f: F) {
-        self.post = Box::new(f);
-    }
-
-    pub fn between<F: 'static + Fn(&mut S)>(&mut self, f: F) {
-        self.between = Box::new(f);
-    }
-
-    pub fn into_stats(self, name: String) -> BenchStats {
-        BenchStats {
-            samples: self.samples,
-            ident: BenchIdentifier::from_str(&name).unwrap(),
-        }
-    }
 }
 
 pub trait Spawner {
@@ -281,6 +182,7 @@ pub trait Spawner {
     fn join(self) -> Self::Result;
 }
 
+/// A `Spawner` from the standard library.
 pub struct StdThread<T> {
     handle: std::thread::JoinHandle<T>,
 }
@@ -349,24 +251,33 @@ where
     }
 }
 
-pub struct ThreadBencher<S, Sp: Spawner> {
+/// A `Bencher` is the struct the user uses to make a benchmark. The `State` type is a user chosen
+/// type that the benchmarking function is given a reference to.
+pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
+    /// Samples for this benchmark
     samples: Vec<u64>,
-    state: S,
+    /// The state.
+    state: State,
+    /// The number of runs
     n: usize,
+    /// A vector of thread handles.
     threads: Vec<Sp>,
-    senders: Vec<Sender<ThreadSignal<S>>>,
-    receivers: Vec<Receiver<ThreadSignal<S>>>,
-    before: Box<Fn(&mut S)>,
-    after: Box<Fn(&mut S)>,
+    senders: Vec<Sender<ThreadSignal<State>>>,
+    receivers: Vec<Receiver<ThreadSignal<State>>>,
+    /// A function to be executed before each benchmark run. This is only ran by one thread.
+    before: Box<Fn(&mut State)>,
+    /// A function to be executed after each benchmark run. This is only ran by one thread.
+    after: Box<Fn(&mut State)>,
     barrier: Arc<Barrier>,
 }
 
-impl<St, Sp> ThreadBencher<St, Sp>
+impl<St, Sp> Bencher<St, Sp>
 where
     St: 'static,
     Sp: Spawner,
     Sp::Return: Send + Default + 'static,
 {
+    /// Construct a new `Bencher`. The initial state and the number of threads is given.
     pub fn new(state: St, n_threads: usize) -> Self {
         let mut senders = Vec::with_capacity(n_threads);
         let mut receivers = Vec::with_capacity(n_threads);
@@ -418,7 +329,7 @@ where
 
     /// Start a threaded benchmark. All threads will run the function given. The state passed in is
     /// shared between all threads.
-    pub fn thread_bench(&mut self, f: fn(&St)) {
+    pub fn bench(&mut self, f: fn(&St)) {
         let func_ptr = FunctionPtr::new(f, &self.state);
         for _i in 0..self.n {
             (self.before)(&mut self.state);
@@ -445,56 +356,35 @@ where
         (self.after)(&mut self.state);
     }
 
+    /// Set the closure that is ran before each benchmark iteration.
     pub fn before<F: 'static + Fn(&mut St)>(&mut self, f: F) {
         self.before = Box::new(f);
     }
 
+    /// Set the closure that is ran afetr each benchmark iteration.
     pub fn after<F: 'static + Fn(&mut St)>(&mut self, f: F) {
         self.after = Box::new(f);
     }
 
-    pub fn into_stats(self, name: String) -> BenchStats {
+    /// Convert the Becnher into `BenchStats` for statistics reporting.
+    pub fn into_stats<S>(self, name: S) -> BenchStats
+    where
+        S: Into<String>,
+    {
         self.threads.into_iter().map(Spawner::join).count();
         BenchStats {
             samples: self.samples,
-            ident: BenchIdentifier::from_str(&name).unwrap(),
+            ident: name.into(),
         }
     }
 }
-
-fn flush() {
-    use std::io::Write;
-    let _ = ::std::io::stdout().flush();
-}
-
 
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
-    fn state_bencher() {
-        struct State {
-            num: i32,
-        };
-
-        let mut b = Bencher::new();
-        b.bench(State { num: 123 }, |_state| {});
-    }
-
-    #[test]
-    fn give_closures() {
-        struct State {
-            num: i32,
-        };
-        let mut b = Bencher::<State>::new();
-        b.pre(|s| s.num += 1);
-        b.post(|s| assert!(s.num == 1i32));
-        b.bench(State { num: 0i32 }, |_| {});
-    }
-
-    #[test]
-    fn threaded() {
+    fn basic() {
         #[derive(Debug, Default, Clone)]
         struct State;
 
@@ -507,8 +397,9 @@ mod test {
             black_box(s);
         }
 
-        let mut b = ThreadBencher::<State, thread::JoinHandle<State>>::new(State, 4);
-        b.thread_bench(sample_function);
-        println!("{}", b.report());
+        let mut b = Bencher::<State>::new(State, 4);
+        b.bench(sample_function);
+        let st = b.into_stats("test benchmark");
+        println!("{}", st.report());
     }
 }
