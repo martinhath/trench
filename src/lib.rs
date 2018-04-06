@@ -1,10 +1,53 @@
 #![feature(asm)]
 #![allow(dead_code)]
-/// A Benchmark runner.
-///
-/// We use this instead of `rustc-test` or `bencher` in order to make it exactly as we want it to
-/// behave, as we need very specific things to happen, in order to go around the thread cleanup
-/// problem.
+//! A Benchmark runner.
+//!
+//! The time measured is the total time for all threads to execute the benchmarked function.
+//! Typical usage can be to have `P` threads enqueue `N / P` elements each, such that the total
+//! number of enqueued elements is `N`.
+//!
+//! ```rust
+//! # extern crate trench;
+//! # use std::sync::mpsc::{Sender, Receiver, channel};
+//! fn queue_push(num_threads: usize) -> trench::BenchStats {
+//!     const N: usize = 10_000;
+//!     // The state is everything the benchmark function needs. This benchmark function needs the
+//!     // channel we're operating on, as well as the total number of threads, so that we control
+//!     // exactly the number of total insertions.
+//!     struct State {
+//!         sender: Sender<u32>,
+//!         receiver: Receiver<u32>,
+//!         num_threads: usize,
+//!     }
+//!
+//!     let (send, recv) = channel();
+//!     // Construct the `State` struct.
+//!     let state = State {
+//!         sender: send,
+//!         receiver: recv,
+//!         num_threads,
+//!     };
+//!
+//!     // This is the function we want to benchmark. Note that this is a function and not a
+//!     // closure, since it is not allowed to capture anything from its environment.
+//!     fn queue_push(state: &State) {
+//!         for i in 0..N / state.num_threads {
+//!             state.sender.send(i as u32);
+//!         }
+//!     }
+//!
+//!     // Make the `Bencher`.
+//!     let mut b = trench::Bencher::<State>::new(state, num_threads);
+//!     b.before(|state| while let Ok(_) = state.receiver.recv() {});
+//!     // Run the benchmark
+//!     b.bench(queue_push);
+//!     b.into_stats("some_name")
+//! }
+//! ```
+//!
+//! We use this instead of `rustc-test` or `bencher` in order to make it exactly as we want it to
+//! behave, as we need very specific things to happen, in order to go around the thread cleanup
+//! problem.
 
 extern crate time;
 
