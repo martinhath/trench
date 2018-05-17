@@ -1,3 +1,4 @@
+#![feature(duration_extras, duration_from_micros)]
 #![feature(asm)]
 #![allow(dead_code)]
 //! A Benchmark runner.
@@ -51,11 +52,20 @@
 
 extern crate time;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::sync::{Arc, Barrier};
-use std::thread;
+use std::thread::{self, sleep};
+use std::time::Duration;
 
 const DEFAULT_NUM_SAMPLES: usize = 200;
+
+macro_rules! print_var {
+    ($e:ident) => {
+        println!("{}: {}", stringify!($e), $e);
+    }
+}
 
 /// Statistics from a benchmark run.
 #[derive(Debug, Clone)]
@@ -64,6 +74,8 @@ pub struct BenchStats {
     ident: String,
     /// The timings from this benchmark.
     samples: Vec<u64>,
+    /// The kind of the benchmark this stats is gotten from.
+    kind: Option<BenchKind>
 }
 
 impl BenchStats {
@@ -75,6 +87,12 @@ impl BenchStats {
 impl BenchStats {
     fn len(&self) -> u64 {
         self.samples.len() as u64
+    }
+
+    pub fn sample_map<F: Fn(u64) -> u64>(&mut self, f: F) {
+        for s in self.samples.iter_mut() {
+            *s = f(*s);
+        }
     }
 
     /// Get the average of the samples
@@ -115,11 +133,28 @@ impl BenchStats {
         self.samples.iter().filter(|&&s| s < avg).count() as u64
     }
 
+    /// Get the number of operations for the duration of the benchmark. Should only be used with
+    /// `bench_for`.
+    pub fn report_count(&self) -> String {
+        if let Some(BenchKind::BenchFor(time)) = self.kind {
+            let ops = self.samples[0] as f64;
+            let us = time.subsec_micros() as f64 + time.as_secs() as f64 * 1_000_000.0;
+            let ops_per_us = ops / us;
+            let ops_per_sec = (ops_per_us * 1_000_000.0) as u64;
+            format!("{} {} ops/sec",
+                    self.ident,
+                    ops_per_sec)
+        } else {
+            panic!("report_count should only be called when using `bench_for`");
+        }
+    }
+
     /// Get a human readable string of these statistics. This is indended to mimic the format used
     /// by `cargo bench`.
     pub fn report(&self) -> String {
         format!(
-            "{} ns/iter (+/- {}) min={} max={} above={} below={}",
+            "{} {} ns/iter (+/- {}) min={} max={} above={} below={}",
+            self.ident,
             Self::fmt_thousands_sep(self.average()),
             Self::fmt_thousands_sep(self.variance()),
             self.min(),
@@ -248,18 +283,25 @@ impl<S> Clone for FunctionPtr<S> {
 }
 
 impl<S> FunctionPtr<S> {
-    fn new(f: fn(&S), state: &S) -> Self {
+    fn new(f: usize, state: &S) -> Self {
         FunctionPtr {
-            data: f as usize,
+            data: f,
             state: &*state,
             _marker: ::std::marker::PhantomData,
         }
     }
 
-    fn call(&mut self) {
+    fn call(&self) {
         unsafe {
             let f = ::std::mem::transmute::<usize, fn(&S)>(self.data);
             (f)(&*self.state);
+        }
+    }
+
+    fn call2(&self) -> u64 {
+        unsafe {
+            let f = ::std::mem::transmute::<usize, fn(&S) -> u64>(self.data);
+            (f)(&*self.state)
         }
     }
 }
@@ -269,6 +311,7 @@ unsafe impl<S> Send for FunctionPtr<S> {}
 #[derive(Debug)]
 enum ThreadSignal<S> {
     Run(FunctionPtr<S>),
+    RunFor(FunctionPtr<S>),
     Done(u64),
     End,
 }
@@ -294,6 +337,12 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BenchKind {
+    BenchN,
+    BenchFor(Duration),
+}
+
 /// A `Bencher` is the struct the user uses to make a benchmark. The `State` type is a user chosen
 /// type that the benchmarking function is given a reference to.
 pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
@@ -312,6 +361,10 @@ pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
     /// A function to be executed after each benchmark run. This is only ran by one thread.
     after: Box<Fn(&mut State)>,
     barrier: Arc<Barrier>,
+    /// A timer used for `bench_for`, so that threads know when they are done.
+    may_continue: Arc<AtomicBool>,
+
+    kind: Option<BenchKind>,
 }
 
 impl<St, Sp> Bencher<St, Sp>
@@ -325,6 +378,7 @@ where
         let mut senders = Vec::with_capacity(n_threads);
         let mut receivers = Vec::with_capacity(n_threads);
         let barrier = Arc::new(Barrier::new(n_threads + 1));
+        let may_continue = Arc::new(AtomicBool::new(false));
         // Start the threads, and give them channels for communication.
         let threads = (0..n_threads)
             .map(|_thread_id| {
@@ -333,6 +387,7 @@ where
                 senders.push(our_send);
                 receivers.push(our_recv);
                 let barrier = barrier.clone();
+                let cont = may_continue.clone();
                 Sp::spawn(move || {
                     let recv = their_recv;
                     let send = their_send;
@@ -344,6 +399,13 @@ where
                                 f.call();
                                 let t1 = time::precise_time_ns();
                                 ThreadSignal::Done(t1 - t0)
+                            }
+                            Ok(ThreadSignal::RunFor(ref mut f)) => {
+                                let mut c = 0;
+                                while cont.load(SeqCst) {
+                                    c += f.call2();
+                                }
+                                ThreadSignal::Done(c)
                             }
                             Ok(ThreadSignal::End) => {
                                 break;
@@ -367,24 +429,32 @@ where
             before: Box::new(|_| {}),
             after: Box::new(|_| {}),
             barrier,
+            may_continue,
+            kind: None,
         }
+    }
+
+    /// Set the number of runs that the benchmark is ran.
+    pub fn set_n(&mut self, n: usize) {
+        self.n = n;
     }
 
     /// Start a threaded benchmark. All threads will run the function given. The state passed in is
     /// shared between all threads.
     pub fn bench(&mut self, f: fn(&St)) {
-        let func_ptr = FunctionPtr::new(f, &self.state);
+        let func_ptr = FunctionPtr::new(f as usize, &self.state);
         for _i in 0..self.n {
             (self.before)(&mut self.state);
             for sender in &self.senders {
                 assert!(sender.send(ThreadSignal::Run(func_ptr.clone())).is_ok());
             }
             // TODO: this is not good: we risk waiting for a long time in `barrier.wait`
-            let t0 = time::precise_time_ns();
             self.barrier.wait();
+            let t0 = time::precise_time_ns();
             for recv in self.receivers.iter() {
                 match recv.recv() {
                     Ok(ThreadSignal::Done(_t)) => {
+                        // NOTE: `_t` is the thread local timing of the function call.
                         // OK
                     }
                     _ => panic!("Thread didn't return correctly"),
@@ -397,6 +467,35 @@ where
             assert!(sender.send(ThreadSignal::End).is_ok());
         }
         (self.after)(&mut self.state);
+        self.kind = Some(BenchKind::BenchN)
+    }
+
+    pub fn bench_for(&mut self, time: Duration, f: fn(&St) -> u64) {
+        let func_ptr = FunctionPtr::new(f as usize, &self.state);
+
+        self.may_continue.store(true, SeqCst);
+        for sender in &self.senders {
+            assert!(sender.send(ThreadSignal::RunFor(func_ptr.clone())).is_ok());
+        }
+
+        (self.before)(&mut self.state);
+        sleep(time);
+        self.may_continue.store(false, SeqCst);
+        let mut total_ops = 0;
+        for recv in self.receivers.iter() {
+            match recv.recv() {
+                Ok(ThreadSignal::Done(num_ops)) => {
+                    total_ops += num_ops;
+                }
+                _ => panic!("Thread didn't return correctly"),
+            }
+        }
+        self.samples.push(total_ops);
+        for sender in &self.senders {
+            assert!(sender.send(ThreadSignal::End).is_ok());
+        }
+        (self.after)(&mut self.state);
+        self.kind = Some(BenchKind::BenchFor(time))
     }
 
     /// Set the closure that is ran before each benchmark iteration.
@@ -418,6 +517,7 @@ where
         BenchStats {
             samples: self.samples,
             ident: name.into(),
+            kind: self.kind,
         }
     }
 }
