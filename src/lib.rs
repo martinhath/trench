@@ -54,10 +54,11 @@ extern crate time;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread::{self, sleep};
 use std::time::Duration;
+use std::default::Default;
 
 const DEFAULT_NUM_SAMPLES: usize = 200;
 
@@ -75,16 +76,14 @@ pub struct BenchStats {
     /// The timings from this benchmark.
     samples: Vec<u64>,
     /// The kind of the benchmark this stats is gotten from.
-    kind: Option<BenchKind>
+    kind: Option<BenchKind>,
 }
 
 impl BenchStats {
     pub fn ident(&self) -> &str {
         &self.ident
     }
-}
 
-impl BenchStats {
     fn len(&self) -> u64 {
         self.samples.len() as u64
     }
@@ -103,7 +102,8 @@ impl BenchStats {
     /// Get the variance of the samples
     pub fn variance(&self) -> u64 {
         let avg = self.average();
-        let s = self.samples
+        let s = self
+            .samples
             .iter()
             .cloned()
             .map(|s| (if s < avg { (avg - s) } else { s - avg }).pow(2))
@@ -133,25 +133,43 @@ impl BenchStats {
         self.samples.iter().filter(|&&s| s < avg).count() as u64
     }
 
+    pub fn count(&self) -> u64 {
+        if let Some(BenchKind::BenchFor(_)) = self.kind {
+            return self.samples[0];
+        } else {
+            panic!("count() should only be called when using `bench_for`");
+        }
+    }
+
+    pub fn report(&self) -> String {
+        match self.kind {
+            Some(BenchKind::BenchFor(_)) => self.report_count(),
+            Some(BenchKind::BenchN) => self.report_n(),
+            _ => unreachable!(),
+        }
+    }
+
     /// Get the number of operations for the duration of the benchmark. Should only be used with
     /// `bench_for`.
-    pub fn report_count(&self) -> String {
+    fn report_count(&self) -> String {
         if let Some(BenchKind::BenchFor(time)) = self.kind {
             let ops = self.samples[0] as f64;
             let us = time.subsec_micros() as f64 + time.as_secs() as f64 * 1_000_000.0;
             let ops_per_us = ops / us;
             let ops_per_sec = (ops_per_us * 1_000_000.0) as u64;
-            format!("{} {} ops/sec",
-                    self.ident,
-                    Self::fmt_thousands_sep(ops_per_sec))
+            format!(
+                "{} {} ops/sec",
+                self.ident,
+                Self::fmt_thousands_sep(ops_per_sec)
+            )
         } else {
-            panic!("report_count should only be called when using `bench_for`");
+            panic!("report_count() should only be called when using `bench_for`");
         }
     }
 
     /// Get a human readable string of these statistics. This is indended to mimic the format used
     /// by `cargo bench`.
-    pub fn report(&self) -> String {
+    fn report_n(&self) -> String {
         format!(
             "{} {} ns/iter (+/- {}) min={} max={} above={} below={}",
             self.ident,
@@ -182,12 +200,7 @@ impl BenchStats {
     pub fn csv_header() -> String {
         format!(
             "{};{};{};{};{};{}",
-            "average",
-            "variance",
-            "min",
-            "max",
-            "# above avg",
-            "# below avg"
+            "average", "variance", "min", "max", "# above avg", "# below avg"
         )
     }
 
@@ -265,14 +278,14 @@ pub struct StdThread<T> {
     handle: std::thread::JoinHandle<T>,
 }
 
-enum FunctionPtr<State> {
+enum FunctionPtr<State, ThreadState> {
     /// Run this function repeatedly `n` times.
     Repeat(fn(&State), Arc<RwLock<State>>),
     /// Run this function, and get some counter back.
-    Count(fn(&State) -> u64, Arc<RwLock<State>>),
+    Count(fn(&State, &mut ThreadState) -> u64, Arc<RwLock<State>>),
 }
 
-impl<S> Clone for FunctionPtr<S> {
+impl<S, TS> Clone for FunctionPtr<S, TS> {
     fn clone(&self) -> Self {
         use FunctionPtr::*;
         match self {
@@ -282,11 +295,16 @@ impl<S> Clone for FunctionPtr<S> {
     }
 }
 
-enum ThreadSignal<S> {
-    Run(FunctionPtr<S>),
-    RunFor(FunctionPtr<S>),
+/// These are all messages that the threads may send to each other.
+enum ThreadSignal<S, TS> {
+    ///
+    Run(FunctionPtr<S, TS>),
+    RunFor(FunctionPtr<S, TS>),
+    /// The thread is done with some action. What the inner u64 represents depends on the operation
+    /// of the thread.
     Done(u64),
     Exec(Box<Fn(usize) + Send>),
+    InitThreadState(Box<Fn(&mut TS) + Send>),
     End,
 }
 
@@ -303,7 +321,9 @@ where
         F: Send + 'static,
         Self::Return: Send + 'static,
     {
-        StdThread { handle: thread::spawn(f) }
+        StdThread {
+            handle: thread::spawn(f),
+        }
     }
 
     fn join(self) -> Self::Result {
@@ -319,7 +339,7 @@ enum BenchKind {
 
 /// A `Bencher` is the struct the user uses to make a benchmark. The `State` type is a user chosen
 /// type that the benchmarking function is given a reference to.
-pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
+pub struct Bencher<State, TS, Sp: Spawner = StdThread<()>> {
     /// Samples for this benchmark
     samples: Vec<u64>,
     /// The state.
@@ -328,8 +348,8 @@ pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
     n: usize,
     /// A vector of thread handles.
     threads: Vec<Sp>,
-    senders: Vec<Sender<ThreadSignal<State>>>,
-    receivers: Vec<Receiver<ThreadSignal<State>>>,
+    senders: Vec<Sender<ThreadSignal<State, TS>>>,
+    receivers: Vec<Receiver<ThreadSignal<State, TS>>>,
     /// A function to be executed before each benchmark run. This is only ran by one thread.
     before: Box<Fn(&mut State)>,
     /// A function to be executed after each benchmark run. This is only ran by one thread.
@@ -341,61 +361,47 @@ pub struct Bencher<State, Sp: Spawner = StdThread<()>> {
     kind: Option<BenchKind>,
 }
 
-impl<St, Sp> Bencher<St, Sp>
+impl<St, Sp> Bencher<St, (), Sp>
 where
     St: 'static + Send + Sync,
     Sp: Spawner,
     Sp::Return: Send + Default + 'static,
 {
     /// Construct a new `Bencher`. The initial state and the number of threads is given.
-    pub fn new(state: St, n_threads: usize) -> Self {
+    pub fn new(state: St, n_threads: usize) -> Bencher<St, (), Sp> {
+        Self::new_inner(state, (), n_threads)
+    }
+}
+
+impl<St, Sp, TS> Bencher<St, TS, Sp>
+where
+    St: 'static + Send + Sync,
+    TS: 'static + Send + Clone,
+    Sp: Spawner,
+    Sp::Return: Send + Default + 'static,
+{
+    pub fn with_local_state(state: St, thread_state: TS, n_threads: usize) -> Self {
+        Self::new_inner(state, thread_state, n_threads)
+    }
+
+    fn new_inner(state: St, thread_state: TS, n_threads: usize) -> Self {
         let mut senders = Vec::with_capacity(n_threads);
         let mut receivers = Vec::with_capacity(n_threads);
         let barrier = Arc::new(Barrier::new(n_threads + 1));
         let may_continue = Arc::new(AtomicBool::new(false));
         // Start the threads, and give them channels for communication.
         let threads = (0..n_threads)
-            .map(|_thread_id| {
+            .map(|thread_id| {
                 let (our_send, their_recv) = channel();
                 let (their_send, our_recv) = channel();
                 senders.push(our_send);
                 receivers.push(our_recv);
+
                 let barrier = barrier.clone();
                 let cont = may_continue.clone();
+                let ts = thread_state.clone();
                 Sp::spawn(move || {
-                    let recv = their_recv;
-                    let send = their_send;
-                    loop {
-                        let signal = match recv.recv() {
-                            Ok(ThreadSignal::Run(FunctionPtr::Repeat(f, s))) => {
-                                barrier.wait();
-                                let state = s.read().unwrap();
-                                let t0 = time::precise_time_ns();
-                                f(&*state);
-                                let t1 = time::precise_time_ns();
-                                ThreadSignal::Done(t1 - t0)
-                            }
-                            Ok(ThreadSignal::RunFor(FunctionPtr::Count(f, s))) => {
-                                let mut c = 0;
-                                let state = s.read().unwrap();
-                                while cont.load(SeqCst) {
-                                    c += f(&*state);
-                                }
-                                ThreadSignal::Done(c)
-                            }
-                            Ok(ThreadSignal::End) => {
-                                break;
-                            }
-                            Ok(ThreadSignal::Exec(f)) => {
-                                f(_thread_id);
-                                continue;
-                            }
-                            Ok(_) => unreachable!(),
-                            Err(e) => panic!("{:?}", e),
-                        };
-                        assert!(send.send(signal).is_ok());
-                    }
-                    Default::default()
+                    Self::thread_fn(thread_id, barrier, cont, ts, their_recv, their_send)
                 })
             })
             .collect();
@@ -412,6 +418,52 @@ where
             may_continue,
             kind: None,
         }
+    }
+
+    /// This is the function that is executed by all threads.
+    fn thread_fn(
+        thread_id: usize,
+        barrier: Arc<Barrier>,
+        cont: Arc<AtomicBool>,
+        mut thread_state: TS,
+        recv: Receiver<ThreadSignal<St, TS>>,
+        send: Sender<ThreadSignal<St, TS>>,
+    ) -> Sp::Return {
+        loop {
+            let signal = match recv.recv().unwrap() {
+                ThreadSignal::Run(FunctionPtr::Repeat(f, s)) => {
+                    barrier.wait();
+                    let state = s.read().unwrap();
+                    let t0 = time::precise_time_ns();
+                    f(&*state);
+                    let t1 = time::precise_time_ns();
+                    ThreadSignal::Done(t1 - t0)
+                }
+                ThreadSignal::RunFor(FunctionPtr::Count(f, s)) => {
+                    let mut c = 0;
+                    let state = s.read().unwrap();
+                    while cont.load(SeqCst) {
+                        c += f(&*state, &mut thread_state);
+                    }
+                    ThreadSignal::Done(c)
+                }
+                ThreadSignal::Exec(f) => {
+                    f(thread_id);
+                    ThreadSignal::Done(0)
+                }
+                ThreadSignal::InitThreadState(f) => {
+                    f(&mut thread_state);
+                    ThreadSignal::Done(0)
+                }
+                | ThreadSignal::Done(_)
+                | ThreadSignal::Run(FunctionPtr::Count(_, _))
+                | ThreadSignal::RunFor(FunctionPtr::Repeat(_, _))
+                    => unreachable!(),
+                ThreadSignal::End => { break; }
+            };
+            assert!(send.send(signal).is_ok());
+        }
+        Default::default()
     }
 
     /// Set the number of runs that the benchmark is ran.
@@ -450,7 +502,7 @@ where
         self.kind = Some(BenchKind::BenchN)
     }
 
-    pub fn bench_for(&mut self, time: Duration, f: fn(&St) -> u64) {
+    pub fn bench_for(&mut self, time: Duration, f: fn(&St, &mut TS) -> u64) {
         let func_ptr = FunctionPtr::Count(f, self.state.clone());
 
         (self.before)(&mut *self.state.write().unwrap());
@@ -478,12 +530,29 @@ where
         self.kind = Some(BenchKind::BenchFor(time))
     }
 
-    /// Set the closure that is ran before each benchmark iteration.
+    fn wait_for_thread_send_done(&self) {
+        for recv in &self.receivers {
+            if let Ok(ThreadSignal::Done(_)) = recv.recv() {}
+            else {
+                panic!("Some thread failed `setup_local()`");
+            }
+        }
+    }
+
+    pub fn setup_local<F: 'static + Send + Clone + Fn(&mut TS)>(&self, f: F) {
+        for sender in &self.senders {
+            let sig = ThreadSignal::InitThreadState(Box::new(f.clone()));
+            assert!(sender.send(sig).is_ok());
+        }
+        self.wait_for_thread_send_done();
+    }
+
+    /// Set the closure that is ran before we start benchmarking.
     pub fn before<F: 'static + Fn(&mut St)>(&mut self, f: F) {
         self.before = Box::new(f);
     }
 
-    /// Set the closure that is ran afetr each benchmark iteration.
+    /// Set the closure that is ran after the benchmarking is done.
     pub fn after<F: 'static + Fn(&mut St)>(&mut self, f: F) {
         self.after = Box::new(f);
     }
@@ -506,12 +575,26 @@ where
             let sig = ThreadSignal::Exec(Box::new(f.clone()));
             assert!(sender.send(sig).is_ok());
         }
+        self.wait_for_thread_send_done();
     }
 
+    /// Get a readable reference to the current state.
     pub fn state(&self) -> ::std::sync::RwLockReadGuard<St> {
         self.state.read().unwrap()
     }
 }
+
+impl<St, Sp, TS> Bencher<St, TS, Sp>
+where
+    St: 'static + Send + Sync + Default,
+    TS: 'static + Send + Clone + Default,
+    Sp: Spawner,
+    Sp::Return: Send + Default + 'static {
+    pub fn default(n_threads: usize) -> Self {
+        Bencher::new_inner(Default::default(), Default::default(), n_threads)
+    }
+}
+
 
 #[cfg(test)]
 mod test {
