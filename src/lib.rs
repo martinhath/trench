@@ -17,7 +17,7 @@ use std::default::Default;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread::sleep;
 use std::thread::{spawn, JoinHandle};
@@ -50,16 +50,23 @@ enum Message<Global, Local> {
     },
 }
 
+/// The result of a benchmark run.
+pub struct BenchResult {
+    pub ops_per_sec: u64,
+    pub time_ns: u64,
+}
+
 pub struct TimedBench<Global, Local> {
     global: Arc<RwLock<Global>>,
     handles: Vec<JoinHandle<()>>,
 
-    senders: Vec<Sender<Message<Global, Local>>>,
+    senders: Vec<SyncSender<Message<Global, Local>>>,
     receivers: Vec<Receiver<Message<Global, Local>>>,
 
     barrier: Arc<Barrier>,
 
-    running: Arc<AtomicBool>,
+    should_start: Arc<AtomicBool>,
+    should_stop: Arc<AtomicBool>,
 
     _marker: PhantomData<Local>,
 }
@@ -73,16 +80,18 @@ where Global: 'static + Default + Send + Sync,
         let mut senders = Vec::with_capacity(num_threads);
         let mut receivers = Vec::with_capacity(num_threads);
         let barrier = Arc::new(Barrier::new(num_threads + 1));
-        let running = Arc::new(AtomicBool::new(false));
+        let should_start = Arc::new(AtomicBool::new(false));
+        let should_stop = Arc::new(AtomicBool::new(false));
 
         let handles = (0..num_threads).map(|thread_id| {
-            let (our_send, their_recv) = channel();
-            let (their_send, our_recv) = channel();
+            let (our_send, their_recv) = sync_channel(1);
+            let (their_send, our_recv) = sync_channel(1);
             senders.push(our_send);
             receivers.push(our_recv);
             let barrier = barrier.clone();
             let global = global.clone();
-            let running = running.clone();
+            let should_start = should_start.clone();
+            let should_stop = should_stop.clone();
             spawn(move || {
                 let local = Local::default();
                 Self::thread_exec(thread_id,
@@ -91,7 +100,8 @@ where Global: 'static + Default + Send + Sync,
                                   their_send,
                                   their_recv,
                                   barrier,
-                                  running);
+                                  should_start, 
+                                  should_stop)
             })
         }).collect::<Vec<_>>();
 
@@ -101,7 +111,8 @@ where Global: 'static + Default + Send + Sync,
             senders,
             receivers,
             barrier,
-            running,
+            should_start, 
+            should_stop,
             _marker: PhantomData,
         }
     }
@@ -110,10 +121,11 @@ where Global: 'static + Default + Send + Sync,
     fn thread_exec(_id: usize,
                    mut local: Local,
                    global: Arc<RwLock<Global>>,
-                   send: Sender<Message<Global, Local>>,
+                   send: SyncSender<Message<Global, Local>>,
                    recv: Receiver<Message<Global, Local>>,
                    barrier: Arc<Barrier>,
-                   running: Arc<AtomicBool>)
+                   should_start: Arc<AtomicBool>,
+                   should_stop: Arc<AtomicBool>)
     {
         while let Ok(msg) = recv.recv() {
             match msg {
@@ -136,13 +148,13 @@ where Global: 'static + Default + Send + Sync,
                     let global = global.read().expect(
                         "Worker failed to get a readlock for the global state."
                     );
-                    while running.load(SeqCst) == false { }
+                     while should_start.load(SeqCst) == false { }
                     let t0 = time();
                     let mut t1 = t0;
                     let mut ops = 0;
                     'outer: loop {
                         for _ in 0..50 {
-                            if !running.load(Relaxed) {
+                            if should_stop.load(Relaxed) {
                                 break 'outer;
                             }
                             f(&global, &mut local);
@@ -150,7 +162,8 @@ where Global: 'static + Default + Send + Sync,
                         }
                         t1 = time();
                         if t1 - t0 > duration_ns {
-                            running.store(false, SeqCst);
+                            should_stop.store(false, SeqCst);
+                            break 'outer;
                         }
                     }
                     send.send(Message::DoneBench {
@@ -194,20 +207,23 @@ where Global: 'static + Default + Send + Sync,
         self.barrier.wait();
     }
 
-    pub fn run_for(&self, duration: Duration, f: fn(&Global, &mut Local)) {
+    pub fn run_for(&self, duration: Duration, f: fn(&Global, &mut Local)) -> BenchResult {
         self.sync();
         for sender in &self.senders {
             sender.send(Message::BenchFor(duration, Box::new(f.clone()))).unwrap();
         }
+        self.should_start.store(false, SeqCst);
+        self.should_stop.store(false, SeqCst);
         self.barrier.wait();
-        self.running.store(true, SeqCst);
+        self.should_start.store(true, SeqCst);
+
         let t0 = time();
         sleep(duration);
         let t1 = time();
         let ns = duration_to_ns(duration);
         assert!(t1 - t0 > ns, "We wanted to sleep {}ns, but slept only {}ns", ns, t1 - t0);
-        self.running.store(false, SeqCst);
-        let ops = self.receivers.iter().enumerate().map(|(i, r)| {
+        self.should_stop.store(false, SeqCst);
+        let ops = self.receivers.iter().map(|r| {
             let msg = r.recv();
             if let Ok(Message::DoneBench { ops, time_spent }) = msg {
                 let frac = time_spent as f64 / ns as f64;
@@ -215,7 +231,7 @@ where Global: 'static + Default + Send + Sync,
                     eprintln!("[WARN] Worker should run for {}ns, but only ran for {}ns",
                               ns, time_spent)
                 }
-                eprintln!("[INFO] {} ops in {}ns", ops, time_spent);
+                // eprintln!("[INFO] {} ops in {}ns", ops, time_spent);
                 return ops;
             } else {
                 panic!("Got back wrong message after `run_for`");
@@ -223,9 +239,10 @@ where Global: 'static + Default + Send + Sync,
         }).sum::<u64>() as f64;
         let secs = ns as f64 / 1_000_000_000.0;
         let ops_per_sec = ops / secs;
-
-        // TODO: What do we want to do with the results?
-        println!("{} ops/sec", fmt_thousands_sep(ops_per_sec as u64));
+        BenchResult {
+            ops_per_sec: ops_per_sec as u64,
+            time_ns: ns,
+        }
     }
 }
 
@@ -240,26 +257,26 @@ impl<Global, Local> Drop for TimedBench<Global, Local> {
     }
 }
 
-fn fmt_thousands_sep(mut n: u64) -> String {
-    let sep = ',';
-    use std::fmt::Write;
-    let mut output = String::new();
-    let mut trailing = false;
-    for &pow in &[9, 6, 3, 0] {
-        let base = 10u64.pow(pow);
-        if pow == 0 || trailing || n / base != 0 {
-            if !trailing {
-                output.write_fmt(format_args!("{}", n / base)).unwrap();
-            } else {
-                output.write_fmt(format_args!("{:03}", n / base)).unwrap();
-            }
-            if pow != 0 {
-                output.push(sep);
-            }
-            trailing = true;
-        }
-        n %= base;
-    }
-
-    output
-}
+// fn fmt_thousands_sep(mut n: u64) -> String {
+//     let sep = ',';
+//     use std::fmt::Write;
+//     let mut output = String::new();
+//     let mut trailing = false;
+//     for &pow in &[9, 6, 3, 0] {
+//         let base = 10u64.pow(pow);
+//         if pow == 0 || trailing || n / base != 0 {
+//             if !trailing {
+//                 output.write_fmt(format_args!("{}", n / base)).unwrap();
+//             } else {
+//                 output.write_fmt(format_args!("{:03}", n / base)).unwrap();
+//             }
+//             if pow != 0 {
+//                 output.push(sep);
+//             }
+//             trailing = true;
+//         }
+//         n %= base;
+//     }
+// 
+//     output
+// }
