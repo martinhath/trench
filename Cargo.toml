@@ -1,6 +1,6 @@
 [package]
 name = "trench"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Martin Hafskjold Thoresen <martinhath@gmail.com>"]
 description = "A benchmark suite for writing threaded benchmarks"
 keywords = ["profile", "multithreading", "threading", "concurrency"]

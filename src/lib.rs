@@ -100,7 +100,7 @@ where Global: 'static + Default + Send + Sync,
                                   their_send,
                                   their_recv,
                                   barrier,
-                                  should_start, 
+                                  should_start,
                                   should_stop)
             })
         }).collect::<Vec<_>>();
@@ -111,7 +111,7 @@ where Global: 'static + Default + Send + Sync,
             senders,
             receivers,
             barrier,
-            should_start, 
+            should_start,
             should_stop,
             _marker: PhantomData,
         }
@@ -177,7 +177,7 @@ where Global: 'static + Default + Send + Sync,
     }
 
     /// Have each thread initialize their local state. This function is executed by all threads.
-    pub fn local_init<F>(&self, f: F)
+    pub fn with_local_state<F>(&self, f: F)
     where F: 'static + Fn(&mut Local) + Send + Clone {
         for send in &self.senders {
             send.send(Message::LocalInit(Box::new(f.clone()))).unwrap();
@@ -186,7 +186,7 @@ where Global: 'static + Default + Send + Sync,
 
     /// Have all threads run the closure on the global state. Useful for initializing the global
     /// state, eg. for prefilling of data structures.
-    pub fn global_init<F>(&self, f: F)
+    pub fn with_global_state<F>(&self, f: F)
     where F: 'static + Fn(&Global) + Send + Clone {
         for send in &self.senders {
             send.send(Message::GlobalInit(Box::new(f.clone()))).unwrap();
@@ -194,7 +194,7 @@ where Global: 'static + Default + Send + Sync,
     }
 
     /// Initailize the global state, but do it single threaded.
-    pub fn global_init_single<F>(&self, f: F)
+    pub fn with_global_state_current_thread<F>(&self, f: F)
     where F: Fn(&mut Global) {
         f(&mut *self.global.write().unwrap());
     }
@@ -277,6 +277,6 @@ impl<Global, Local> Drop for TimedBench<Global, Local> {
 //         }
 //         n %= base;
 //     }
-// 
+//
 //     output
 // }
